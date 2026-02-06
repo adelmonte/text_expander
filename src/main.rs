@@ -11,16 +11,20 @@ use std::{
     time::Duration,
 };
 
-// Espanso config format
+// Espanso-compatible config format
 #[derive(Debug, Deserialize)]
 struct EspansoConfig {
     #[serde(default)]
     matches: Vec<Match>,
+    #[serde(default)]
+    global_vars: Vec<Var>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Match {
     trigger: Option<String>,
+    #[serde(default)]
+    triggers: Vec<String>,
     replace: Option<String>,
     #[serde(default)]
     vars: Vec<Var>,
@@ -39,6 +43,7 @@ struct Var {
 struct VarParams {
     format: Option<String>,
     cmd: Option<String>,
+    echo: Option<String>,
 }
 
 #[derive(Clone)]
@@ -65,7 +70,10 @@ impl Trigger {
                     }
                 }
                 "clipboard" => run_command("wl-paste", &["-n"]),
-                "echo" => var.params.format.clone().unwrap_or_default(),
+                "echo" => var.params.echo.as_ref()
+                    .or(var.params.format.as_ref())
+                    .cloned()
+                    .unwrap_or_default(),
                 _ => format!("{{{{{}}}}}", var.name),
             };
             result = result.replace(&format!("{{{{{}}}}}", var.name), &value);
@@ -120,26 +128,43 @@ fn key_to_char(key: Key, shift: bool) -> Option<char> {
     Some(if shift && c.is_ascii_alphabetic() { c.to_ascii_uppercase() } else { c })
 }
 
-fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>) {
+fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>, global_vars: &mut Vec<Var>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            load_yaml_recursive(&path, triggers);
+            load_yaml_recursive(&path, triggers, global_vars);
         } else if path.extension().map_or(false, |e| e == "yaml" || e == "yml") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(config) = serde_yaml::from_str::<EspansoConfig>(&content) {
+            let Ok(content) = fs::read_to_string(&path) else { continue };
+            match serde_yaml::from_str::<EspansoConfig>(&content) {
+                Ok(config) => {
+                    global_vars.extend(config.global_vars);
                     let mut count = 0;
                     for m in config.matches {
-                        if let (Some(trig), Some(replace)) = (m.trigger, m.replace) {
-                            triggers.insert(trig, Trigger { replace, vars: m.vars });
+                        let Some(replace) = m.replace else { continue };
+
+                        // Collect all triggers: singular `trigger` and plural `triggers`
+                        let mut all_triggers = Vec::new();
+                        if let Some(t) = m.trigger {
+                            all_triggers.push(t);
+                        }
+                        all_triggers.extend(m.triggers);
+
+                        for trig in all_triggers {
+                            triggers.insert(trig, Trigger {
+                                replace: replace.clone(),
+                                vars: m.vars.clone(),
+                            });
                             count += 1;
                         }
                     }
                     if count > 0 {
                         eprintln!("Loaded {} triggers from {:?}", count, path);
                     }
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to parse {:?}: {}", path, e);
                 }
             }
         }
@@ -148,13 +173,24 @@ fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>) {
 
 fn load_configs() -> HashMap<String, Trigger> {
     let mut triggers = HashMap::new();
+    let mut global_vars = Vec::new();
     let config_dir = get_config_path();
 
     if config_dir.exists() {
-        load_yaml_recursive(&config_dir, &mut triggers);
+        load_yaml_recursive(&config_dir, &mut triggers, &mut global_vars);
     } else {
         eprintln!("Config directory not found: {:?}", config_dir);
     }
+
+    // Prepend global_vars to each trigger's vars (so they're available for expansion)
+    if !global_vars.is_empty() {
+        for trigger in triggers.values_mut() {
+            let mut merged = global_vars.clone();
+            merged.extend(trigger.vars.clone());
+            trigger.vars = merged;
+        }
+    }
+
     triggers
 }
 
@@ -319,7 +355,6 @@ fn daemonize() {
     let devnull = fs::OpenOptions::new()
         .read(true).write(true).open("/dev/null").unwrap();
 
-    use std::os::unix::io::AsRawFd;
     unsafe {
         libc::dup2(devnull.as_raw_fd(), 0);
         libc::dup2(devnull.as_raw_fd(), 1);
