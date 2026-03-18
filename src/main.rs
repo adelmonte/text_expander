@@ -389,9 +389,9 @@ fn main() {
     }
 
     let mut expander = TextExpander::new(triggers);
-    let raw_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
 
     loop {
+        let raw_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
         let mut pollfds: Vec<libc::pollfd> = raw_fds.iter()
             .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
@@ -400,13 +400,27 @@ fn main() {
             continue;
         }
 
+        let mut i = pollfds.len();
+        while i > 0 {
+            i -= 1;
+            if pollfds[i].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                eprintln!("Keyboard disconnected (fd {}), removing", raw_fds[i]);
+                keyboards.remove(i);
+            }
+        }
+        if keyboards.is_empty() {
+            eprintln!("All keyboards disconnected, exiting");
+            process::exit(0);
+        }
+
         let ready: Vec<usize> = pollfds.iter().enumerate()
             .filter(|(_, p)| p.revents & libc::POLLIN != 0)
             .map(|(i, _)| i).collect();
 
         let mut expanded = false;
 
-        for i in ready {
+        for &i in &ready {
+            if i >= keyboards.len() { continue }
             if let Ok(events) = keyboards[i].fetch_events() {
                 for ev in events {
                     if ev.event_type() == EventType::KEY {
@@ -422,8 +436,9 @@ fn main() {
 
         if expanded {
             thread::sleep(Duration::from_millis(50));
+            let drain_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
             loop {
-                let mut drain: Vec<libc::pollfd> = raw_fds.iter()
+                let mut drain: Vec<libc::pollfd> = drain_fds.iter()
                     .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
                     .collect();
                 if unsafe { libc::poll(drain.as_mut_ptr(), drain.len() as _, 0) } <= 0 { break }
