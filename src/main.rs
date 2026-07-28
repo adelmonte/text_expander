@@ -4,9 +4,11 @@ use std::{
     collections::HashMap,
     env,
     fs,
+    io::ErrorKind,
     os::unix::io::AsRawFd,
     path::PathBuf,
     process,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
@@ -211,7 +213,11 @@ fn get_config_path() -> PathBuf {
     PathBuf::from(home).join(".config/text_expander")
 }
 
-fn find_keyboards() -> Vec<Device> {
+// With `virtual_only`, collapse to the single virtual keyboard a remapper (keyd/kmonad) exposes,
+// since it replays every real keystroke. Off by default: output-only virtual devices such as
+// ydotoold's also match the name, and preferring one of those means reading a device that never
+// emits the user's typing.
+fn find_keyboards(virtual_only: bool) -> Vec<Device> {
     let mut keyboards = Vec::new();
     let mut virtual_kbd = None;
 
@@ -231,18 +237,26 @@ fn find_keyboards() -> Vec<Device> {
         let name = device.name().unwrap_or("unknown");
         eprintln!("Found keyboard: {:?} - {}", path, name);
 
-        if name.to_lowercase().contains("virtual") {
+        if virtual_only && name.to_lowercase().contains("virtual") {
             virtual_kbd = Some(device);
-        } else if virtual_kbd.is_none() {
+        } else {
             keyboards.push(device);
         }
     }
 
-    if let Some(vkbd) = virtual_kbd {
-        eprintln!("Using virtual keyboard only (keyd/kmonad detected)");
-        vec![vkbd]
-    } else {
-        keyboards
+    if !virtual_only {
+        return keyboards;
+    }
+
+    match virtual_kbd {
+        Some(vkbd) => {
+            eprintln!("Using virtual keyboard only (--virtual-only)");
+            vec![vkbd]
+        }
+        None => {
+            eprintln!("Warning: --virtual-only given but no virtual keyboard found, using all keyboards");
+            keyboards
+        }
     }
 }
 
@@ -265,17 +279,36 @@ fn get_wayland_env() -> Vec<(String, String)> {
     env_vars
 }
 
+static MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn run_wtype(args: &[&str]) {
-    if let Ok(sudo_user) = env::var("SUDO_USER") {
-        let mut cmd = process::Command::new("sudo");
-        cmd.arg("-u").arg(&sudo_user).arg("env");
-        for (k, v) in get_wayland_env() {
-            cmd.arg(format!("{}={}", k, v));
+    let (bin, mut cmd) = match env::var("SUDO_USER") {
+        Ok(sudo_user) => {
+            let mut cmd = process::Command::new("sudo");
+            cmd.arg("-u").arg(&sudo_user).arg("env");
+            for (k, v) in get_wayland_env() {
+                cmd.arg(format!("{}={}", k, v));
+            }
+            cmd.arg("wtype").args(args);
+            ("sudo", cmd)
         }
-        cmd.arg("wtype").args(args);
-        let _ = cmd.status();
-    } else {
-        let _ = process::Command::new("wtype").args(args).status();
+        Err(_) => {
+            let mut cmd = process::Command::new("wtype");
+            cmd.args(args);
+            ("wtype", cmd)
+        }
+    };
+
+    // Never fatal: a failed expansion should not take down a running daemon.
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("{} exited with {}", bin, status),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if !MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("{} not found - expansions cannot be typed. Install wtype.", bin);
+            }
+        }
+        Err(e) => eprintln!("Failed to run {}: {}", bin, e),
     }
 }
 
@@ -365,6 +398,7 @@ fn daemonize() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let daemon_mode = args.iter().any(|a| a == "-d" || a == "--daemon");
+    let virtual_only = args.iter().any(|a| a == "--virtual-only");
 
     eprintln!("text_expander - lightweight espanso replacement for Wayland");
 
@@ -375,9 +409,9 @@ fn main() {
     }
     eprintln!("Loaded {} triggers", triggers.len());
 
-    let mut keyboards = find_keyboards();
+    let mut keyboards = find_keyboards(virtual_only);
     if keyboards.is_empty() {
-        eprintln!("No keyboards found. Need read access to /dev/input/*");
+        eprintln!("No keyboards found. Need read access to /dev/input/* (join the 'input' group)");
         process::exit(1);
     }
 
