@@ -9,6 +9,7 @@ Supports the most commonly used espanso match features (simple triggers, variabl
 - Linux + Wayland
 - `wtype` (text injection)
 - `wl-paste` (clipboard variable support)
+- `libxkbcommon` (keyboard layout decoding)
 - Read access to `/dev/input/event*`
 
 Root is not required. On most distros `/dev/input/event*` is owned by the `input` group, so
@@ -33,7 +34,11 @@ sudo cp target/release/text_expander /usr/local/bin/
 text_expander                  # foreground
 text_expander -d               # daemon mode
 text_expander --virtual-only   # keyd/kmonad setups (see below)
+text_expander --debug-keys     # print each decoded character and the trigger buffer
 ```
+
+Use `--debug-keys` when triggers do not fire: it shows what the program thinks you typed, which
+immediately reveals a wrong keyboard layout.
 
 ### `--virtual-only`
 
@@ -51,6 +56,34 @@ matches. Without the flag, all detected keyboards are read.
 Location: `~/.config/text_expander/`
 
 All `.yml` and `.yaml` files are loaded recursively.
+
+### Keyboard layout (required for non-US layouts)
+
+evdev reports *physical key positions*, not characters, so the active keymap is needed to know what
+you typed. Set it in `config/default.yml`, using espanso's `keyboard_layout` block:
+
+```yaml
+keyboard_layout:
+  layout: "de"
+  variant: "neo"
+  # optional, all default to empty (libxkbcommon's own defaults)
+  # rule: ""
+  # model: "pc105"
+  # options: "grp:alt_shift_toggle"
+```
+
+Resolved by libxkbcommon against the same data X and Wayland compositors use, so any
+layout/variant in `/usr/share/X11/xkb/symbols/` works. Modifier levels come along for free —
+including multi-level layouts like Neo, whose level 3-6 symbols and home-row numpad decode
+correctly.
+
+If omitted, the `XKB_DEFAULT_LAYOUT`/`XKB_DEFAULT_VARIANT` environment variables are used, falling
+back to US. A wrong layout means triggers silently never match, so a warning is printed when
+nothing is configured, and an unknown layout name is a hard error rather than a silent US fallback.
+
+**Layout switching is not tracked.** The configured layout is always used. If you have several
+groups configured (e.g. `layout: "de,de"`) and switch between them, triggers only match while the
+configured one is active.
 
 ### Syntax (espanso-compatible)
 
@@ -137,8 +170,9 @@ Simple trigger/replace matches and basic variable types will work as-is. Matches
 ## How It Works
 
 1. Reads keyboard input via evdev (all keyboards, or one virtual device with `--virtual-only`)
-2. Buffers keystrokes and matches against triggers
-3. On match: sends backspaces to delete trigger, types replacement via `wtype`
+2. Decodes keycodes into characters with libxkbcommon, using the configured layout
+3. Buffers characters and matches against triggers
+4. On match: sends backspaces to delete trigger, types replacement via `wtype`
 
 ## Systemd Service
 
