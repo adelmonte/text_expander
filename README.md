@@ -9,7 +9,16 @@ Supports the most commonly used espanso match features (simple triggers, variabl
 - Linux + Wayland
 - `wtype` (text injection)
 - `wl-paste` (clipboard variable support)
-- Root access for `/dev/input/event*`
+- Read access to `/dev/input/event*`
+
+Root is not required. On most distros `/dev/input/event*` is owned by the `input` group, so
+joining it is enough:
+
+```bash
+sudo usermod -aG input "$USER"
+```
+
+Log out and back in for the new group to apply (`id` should list `input`).
 
 ## Build
 
@@ -21,9 +30,21 @@ sudo cp target/release/text_expander /usr/local/bin/
 ## Usage
 
 ```bash
-sudo text_expander        # foreground
-sudo text_expander -d     # daemon mode
+text_expander                  # foreground
+text_expander -d               # daemon mode
+text_expander --virtual-only   # keyd/kmonad setups (see below)
 ```
+
+### `--virtual-only`
+
+Key remappers like [keyd](https://github.com/rvaiya/keyd) and
+[kmonad](https://github.com/kmonad/kmonad) expose a virtual keyboard that replays every real
+keystroke. On those setups, pass `--virtual-only` to read that device alone and avoid seeing each
+keystroke twice.
+
+Do not pass it otherwise. Output-only virtual devices — such as the one `ydotoold` creates — also
+have "virtual" in their name but never emit your typing, so preferring one means no trigger ever
+matches. Without the flag, all detected keyboards are read.
 
 ## Config
 
@@ -115,31 +136,29 @@ Simple trigger/replace matches and basic variable types will work as-is. Matches
 
 ## How It Works
 
-1. Reads keyboard input via evdev (prefers virtual keyboards like keyd/kmonad)
+1. Reads keyboard input via evdev (all keyboards, or one virtual device with `--virtual-only`)
 2. Buffers keystrokes and matches against triggers
 3. On match: sends backspaces to delete trigger, types replacement via `wtype`
 
 ## Systemd Service
 
-`/etc/systemd/system/text_expander.service`:
+Run as a user service so it inherits your Wayland session. `~/.config/systemd/user/text_expander.service`:
 
 ```ini
 [Unit]
 Description=Text Expander
-After=graphical.target
+After=graphical-session.target
 
 [Service]
 ExecStart=/usr/local/bin/text_expander
 Restart=always
-Environment=SUDO_USER=yourusername
-Environment=SUDO_UID=1000
 
 [Install]
-WantedBy=graphical.target
+WantedBy=graphical-session.target
 ```
 
 ```bash
-sudo systemctl enable --now text_expander
+systemctl --user enable --now text_expander
 ```
 
 ## License
