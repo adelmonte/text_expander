@@ -10,7 +10,7 @@ use std::{
     process,
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use xkbcommon::xkb;
 
@@ -273,19 +273,34 @@ fn get_config_path() -> PathBuf {
     PathBuf::from(home).join(".config/text_expander")
 }
 
+// The path is kept alongside the device so a rescan can tell an already-open keyboard from a new
+// one. Without it, rescanning re-opens live devices and every keystroke arrives twice.
+struct Keyboard {
+    path: PathBuf,
+    device: Device,
+}
+
+// Last match wins, matching the pre-rescan behaviour where the loop overwrote `virtual_kbd`.
+fn pick_virtual(names: &[String]) -> Option<usize> {
+    names.iter().rposition(|n| n.to_lowercase().contains("virtual"))
+}
+
+// Adds keyboards that appeared since the last call, leaving already-tracked ones untouched. Called
+// once at startup with an empty list and then periodically, so hotplug and cold start share a path.
+//
 // With `virtual_only`, collapse to the single virtual keyboard a remapper (keyd/kmonad) exposes,
 // since it replays every real keystroke. Off by default: output-only virtual devices such as
 // ydotoold's also match the name, and preferring one of those means reading a device that never
 // emits the user's typing.
-fn find_keyboards(virtual_only: bool) -> Vec<Device> {
-    let mut keyboards = Vec::new();
-    let mut virtual_kbd = None;
+fn scan_keyboards(virtual_only: bool, keyboards: &mut Vec<Keyboard>) {
+    let Ok(entries) = fs::read_dir("/dev/input") else { return };
 
-    let Ok(entries) = fs::read_dir("/dev/input") else { return keyboards };
+    let mut found = 0;
 
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.to_string_lossy().contains("event") { continue }
+        if keyboards.iter().any(|k| k.path == path) { continue }
 
         let Ok(device) = Device::open(&path) else { continue };
 
@@ -294,28 +309,31 @@ fn find_keyboards(virtual_only: bool) -> Vec<Device> {
         let Some(keys) = device.supported_keys() else { continue };
         if !keys.contains(Key::KEY_A) || !keys.contains(Key::KEY_Z) { continue }
 
-        let name = device.name().unwrap_or("unknown");
-        eprintln!("Found keyboard: {:?} - {}", path, name);
-
-        if virtual_only && name.to_lowercase().contains("virtual") {
-            virtual_kbd = Some(device);
-        } else {
-            keyboards.push(device);
-        }
+        eprintln!("Found keyboard: {:?} - {}", path, device.name().unwrap_or("unknown"));
+        keyboards.push(Keyboard { path, device });
+        found += 1;
     }
 
-    if !virtual_only {
-        return keyboards;
+    if found == 0 || !virtual_only {
+        return;
     }
 
-    match virtual_kbd {
-        Some(vkbd) => {
-            eprintln!("Using virtual keyboard only (--virtual-only)");
-            vec![vkbd]
+    // Re-applied over the whole set, not just the arrivals, so a remapper started after us still
+    // wins: the fall-back set of real keyboards collapses as soon as its virtual device shows up.
+    let names: Vec<String> = keyboards.iter()
+        .map(|k| k.device.name().unwrap_or("unknown").to_string())
+        .collect();
+
+    match pick_virtual(&names) {
+        Some(i) => {
+            if keyboards.len() > 1 {
+                eprintln!("Using virtual keyboard only (--virtual-only): {}", names[i]);
+            }
+            keyboards.drain(i + 1..);
+            keyboards.drain(..i);
         }
         None => {
             eprintln!("Warning: --virtual-only given but no virtual keyboard found, using all keyboards");
-            keyboards
         }
     }
 }
@@ -503,7 +521,8 @@ fn main() {
         process::exit(1);
     };
 
-    let mut keyboards = find_keyboards(virtual_only);
+    let mut keyboards = Vec::new();
+    scan_keyboards(virtual_only, &mut keyboards);
     if keyboards.is_empty() {
         eprintln!("No keyboards found. Need read access to /dev/input/* (join the 'input' group)");
         process::exit(1);
@@ -518,27 +537,57 @@ fn main() {
 
     let mut expander = TextExpander::new(configs.triggers, decoder, debug_keys);
 
+    // Long enough that the idle cost is one read_dir per second, short enough that a replugged
+    // keyboard starts working before the user notices.
+    const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+    let mut last_scan = Instant::now();
+    let mut waiting_logged = false;
+
     loop {
-        let raw_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
-        let mut pollfds: Vec<libc::pollfd> = raw_fds.iter()
-            .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+        let mut pollfds: Vec<libc::pollfd> = keyboards.iter()
+            .map(|k| libc::pollfd { fd: k.device.as_raw_fd(), events: libc::POLLIN, revents: 0 })
             .collect();
 
-        if unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) } < 0 {
+        // With no keyboards left this is just a sleep until the next rescan.
+        if unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, RESCAN_INTERVAL.as_millis() as _) } < 0 {
             continue;
         }
 
+        let mut removed = false;
         let mut i = pollfds.len();
         while i > 0 {
             i -= 1;
             if pollfds[i].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                eprintln!("Keyboard disconnected (fd {}), removing", raw_fds[i]);
+                eprintln!("Keyboard disconnected ({:?}), removing", keyboards[i].path);
                 keyboards.remove(i);
+                removed = true;
             }
         }
-        if keyboards.is_empty() {
-            eprintln!("All keyboards disconnected, exiting");
-            process::exit(0);
+
+        // Rescan on a timer rather than on poll timeout: under autorepeat poll may never time out,
+        // and a keyboard plugged in mid-typing should not have to wait for an idle gap. Note this
+        // also adopts virtual devices created after startup (a late `ydotoold`), which in the
+        // default mode means reading back our own injected keystrokes -- the post-expansion drain
+        // below and --virtual-only remain the mitigations for that.
+        if removed || last_scan.elapsed() >= RESCAN_INTERVAL {
+            scan_keyboards(virtual_only, &mut keyboards);
+            last_scan = Instant::now();
+
+            if keyboards.is_empty() {
+                if !waiting_logged {
+                    eprintln!("All keyboards disconnected, waiting for one to reappear");
+                    waiting_logged = true;
+                }
+            } else {
+                waiting_logged = false;
+            }
+        }
+
+        // Every `ready` index above a removal now points at the wrong device, so skip this round
+        // entirely. Nothing is lost: events already queued on the survivors stay buffered in the
+        // kernel and the next poll reports them immediately.
+        if removed {
+            continue;
         }
 
         let ready: Vec<usize> = pollfds.iter().enumerate()
@@ -548,8 +597,7 @@ fn main() {
         let mut expanded = false;
 
         for &i in &ready {
-            if i >= keyboards.len() { continue }
-            if let Ok(events) = keyboards[i].fetch_events() {
+            if let Ok(events) = keyboards[i].device.fetch_events() {
                 for ev in events {
                     if ev.event_type() == EventType::KEY {
                         if let Some((n, text)) = expander.process(ev.code(), ev.value()) {
@@ -564,7 +612,7 @@ fn main() {
 
         if expanded {
             thread::sleep(Duration::from_millis(50));
-            let drain_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
+            let drain_fds: Vec<i32> = keyboards.iter().map(|k| k.device.as_raw_fd()).collect();
             loop {
                 let mut drain: Vec<libc::pollfd> = drain_fds.iter()
                     .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
@@ -572,7 +620,7 @@ fn main() {
                 if unsafe { libc::poll(drain.as_mut_ptr(), drain.len() as _, 0) } <= 0 { break }
                 for (i, p) in drain.iter().enumerate() {
                     if p.revents & libc::POLLIN != 0 {
-                        let _ = keyboards[i].fetch_events().map(|e| e.count());
+                        let _ = keyboards[i].device.fetch_events().map(|e| e.count());
                     }
                 }
             }
@@ -694,5 +742,27 @@ mod tests {
         e.process(KEY_Z, 0);
         // "üü" is 4 bytes but must delete only 2 typed characters.
         assert_eq!(e.process(KEY_Z, 1), Some((2, "x".into())));
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).into()).collect()
+    }
+
+    #[test]
+    fn picks_virtual_keyboard_case_insensitively() {
+        assert_eq!(pick_virtual(&names(&["AT Translated Set 2 keyboard", "keyd virtual keyboard"])), Some(1));
+        assert_eq!(pick_virtual(&names(&["KMonad Virtual Keyboard", "Logitech K380"])), Some(0));
+    }
+
+    #[test]
+    fn picks_no_virtual_keyboard_when_none_matches() {
+        assert_eq!(pick_virtual(&names(&["AT Translated Set 2 keyboard", "Logitech K380"])), None);
+        assert_eq!(pick_virtual(&[]), None);
+    }
+
+    // Ties go to the last match, as the pre-rescan scan loop did by overwriting its candidate.
+    #[test]
+    fn picks_last_virtual_keyboard_on_tie() {
+        assert_eq!(pick_virtual(&names(&["ydotoold virtual device", "real kbd", "keyd virtual keyboard"])), Some(2));
     }
 }

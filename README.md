@@ -51,6 +51,18 @@ Do not pass it otherwise. Output-only virtual devices — such as the one `ydoto
 have "virtual" in their name but never emit your typing, so preferring one means no trigger ever
 matches. Without the flag, all detected keyboards are read.
 
+If the remapper starts after `text_expander`, its virtual keyboard is picked up on the next rescan
+(see below) and the real keyboards are dropped at that point.
+
+### Hotplug
+
+`/dev/input` is rescanned about once a second, so keyboards plugged in while the program runs start
+working within a second. Unplugging is handled too: the device is dropped and, if it was the last
+one, the program waits for a keyboard to reappear instead of exiting.
+
+At least one readable keyboard must be present at startup — otherwise it exits with the
+`input`-group hint, since that is nearly always a permissions problem rather than an empty machine.
+
 ## Config
 
 Location: `~/.config/text_expander/`
@@ -169,7 +181,8 @@ Simple trigger/replace matches and basic variable types will work as-is. Matches
 
 ## How It Works
 
-1. Reads keyboard input via evdev (all keyboards, or one virtual device with `--virtual-only`)
+1. Reads keyboard input via evdev (all keyboards, or one virtual device with `--virtual-only`),
+   rescanning `/dev/input` once a second so devices can come and go
 2. Decodes keycodes into characters with libxkbcommon, using the configured layout
 3. Buffers characters and matches against triggers
 4. On match: sends backspaces to delete trigger, types replacement via `wtype`
