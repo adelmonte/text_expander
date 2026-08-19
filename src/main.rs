@@ -4,12 +4,15 @@ use std::{
     collections::HashMap,
     env,
     fs,
+    io::ErrorKind,
     os::unix::io::AsRawFd,
     path::PathBuf,
     process,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+use xkbcommon::xkb;
 
 // Espanso-compatible config format
 #[derive(Debug, Deserialize)]
@@ -18,6 +21,22 @@ struct EspansoConfig {
     matches: Vec<Match>,
     #[serde(default)]
     global_vars: Vec<Var>,
+    keyboard_layout: Option<KeyboardLayout>,
+}
+
+// espanso's `keyboard_layout` block. Empty strings are meaningful: libxkbcommon falls back to the
+// XKB_DEFAULT_* env vars, then to US.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+struct KeyboardLayout {
+    #[serde(default, alias = "rules")]
+    rule: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    layout: String,
+    #[serde(default)]
+    variant: String,
+    options: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,54 +111,97 @@ fn run_command(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn key_to_char(key: Key, shift: bool) -> Option<char> {
-    let c = match key {
-        Key::KEY_A => 'a', Key::KEY_B => 'b', Key::KEY_C => 'c', Key::KEY_D => 'd',
-        Key::KEY_E => 'e', Key::KEY_F => 'f', Key::KEY_G => 'g', Key::KEY_H => 'h',
-        Key::KEY_I => 'i', Key::KEY_J => 'j', Key::KEY_K => 'k', Key::KEY_L => 'l',
-        Key::KEY_M => 'm', Key::KEY_N => 'n', Key::KEY_O => 'o', Key::KEY_P => 'p',
-        Key::KEY_Q => 'q', Key::KEY_R => 'r', Key::KEY_S => 's', Key::KEY_T => 't',
-        Key::KEY_U => 'u', Key::KEY_V => 'v', Key::KEY_W => 'w', Key::KEY_X => 'x',
-        Key::KEY_Y => 'y', Key::KEY_Z => 'z',
-        Key::KEY_1 => if shift { '!' } else { '1' },
-        Key::KEY_2 => if shift { '@' } else { '2' },
-        Key::KEY_3 => if shift { '#' } else { '3' },
-        Key::KEY_4 => if shift { '$' } else { '4' },
-        Key::KEY_5 => if shift { '%' } else { '5' },
-        Key::KEY_6 => if shift { '^' } else { '6' },
-        Key::KEY_7 => if shift { '&' } else { '7' },
-        Key::KEY_8 => if shift { '*' } else { '8' },
-        Key::KEY_9 => if shift { '(' } else { '9' },
-        Key::KEY_0 => if shift { ')' } else { '0' },
-        Key::KEY_MINUS => if shift { '_' } else { '-' },
-        Key::KEY_EQUAL => if shift { '+' } else { '=' },
-        Key::KEY_LEFTBRACE => if shift { '{' } else { '[' },
-        Key::KEY_RIGHTBRACE => if shift { '}' } else { ']' },
-        Key::KEY_SEMICOLON => if shift { ':' } else { ';' },
-        Key::KEY_APOSTROPHE => if shift { '"' } else { '\'' },
-        Key::KEY_GRAVE => if shift { '~' } else { '`' },
-        Key::KEY_BACKSLASH => if shift { '|' } else { '\\' },
-        Key::KEY_COMMA => if shift { '<' } else { ',' },
-        Key::KEY_DOT => if shift { '>' } else { '.' },
-        Key::KEY_SLASH => if shift { '?' } else { '/' },
-        Key::KEY_SPACE => ' ',
-        _ => return None,
-    };
-    Some(if shift && c.is_ascii_alphabetic() { c.to_ascii_uppercase() } else { c })
+// evdev reports physical key positions, not characters. Which character a position produces depends
+// on the active keymap, so a hardcoded US table decodes most keys wrong on any other layout.
+// libxkbcommon compiles the real keymap and tracks modifier state, so layouts with more than the
+// two shift levels decode correctly as well.
+struct Decoder {
+    state: xkb::State,
 }
 
-fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>, global_vars: &mut Vec<Var>) {
+impl Decoder {
+    fn new(cfg: &KeyboardLayout) -> Option<Self> {
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &ctx,
+            cfg.rule.as_str(),
+            cfg.model.as_str(),
+            cfg.layout.as_str(),
+            cfg.variant.as_str(),
+            cfg.options.clone(),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )?;
+        Some(Self { state: xkb::State::new(&keymap) })
+    }
+
+    // `value` is the raw evdev value: 0 release, 1 press, 2 autorepeat.
+    // Returns the text produced by a press, if any.
+    fn feed(&mut self, code: u16, value: i32) -> Option<String> {
+        // xkb keycodes are evdev codes offset by 8.
+        let keycode = xkb::Keycode::new(code as u32 + 8);
+
+        match value {
+            // Read the symbol before updating state, so a locked or latched modifier does not apply
+            // to the keypress that set it. Layouts that put a level switch on CapsLock rely on this.
+            1 => {
+                let text = self.state.key_get_utf8(keycode);
+                self.state.update_key(keycode, xkb::KeyDirection::Down);
+                Some(text)
+            }
+            0 => {
+                self.state.update_key(keycode, xkb::KeyDirection::Up);
+                None
+            }
+            // Autorepeat. Must not reach update_key, which would register as a release and
+            // desynchronise the modifier state.
+            _ => None,
+        }
+    }
+
+    // Ctrl/Alt/Super combinations are shortcuts rather than text. Level switches (Mod3/Mod5) are
+    // deliberately excluded: they select further symbol levels, so they produce text, not shortcuts.
+    fn shortcut_active(&self) -> bool {
+        [xkb::MOD_NAME_CTRL, xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO]
+            .iter()
+            .any(|m| self.state.mod_name_is_active(*m, xkb::STATE_MODS_EFFECTIVE))
+    }
+}
+
+#[derive(Default)]
+struct Configs {
+    triggers: HashMap<String, Trigger>,
+    global_vars: Vec<Var>,
+    layout: Option<KeyboardLayout>,
+}
+
+fn load_yaml_recursive(dir: &PathBuf, configs: &mut Configs) {
     let Ok(entries) = fs::read_dir(dir) else { return };
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            load_yaml_recursive(&path, triggers, global_vars);
+            load_yaml_recursive(&path, configs);
         } else if path.extension().map_or(false, |e| e == "yaml" || e == "yml") {
             let Ok(content) = fs::read_to_string(&path) else { continue };
             match serde_yaml::from_str::<EspansoConfig>(&content) {
                 Ok(config) => {
-                    global_vars.extend(config.global_vars);
+                    configs.global_vars.extend(config.global_vars);
+
+                    // read_dir order is arbitrary, so keep the first layout found and only
+                    // complain if a later file disagrees.
+                    if let Some(layout) = config.keyboard_layout {
+                        match &configs.layout {
+                            None => {
+                                eprintln!("Keyboard layout from {:?}: {:?}", path, layout);
+                                configs.layout = Some(layout);
+                            }
+                            Some(existing) if *existing != layout => {
+                                eprintln!("Warning: ignoring conflicting keyboard_layout in {:?}", path);
+                            }
+                            Some(_) => {}
+                        }
+                    }
+
                     let mut count = 0;
                     for m in config.matches {
                         let Some(replace) = m.replace else { continue };
@@ -152,7 +214,7 @@ fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>, g
                         all_triggers.extend(m.triggers);
 
                         for trig in all_triggers {
-                            triggers.insert(trig, Trigger {
+                            configs.triggers.insert(trig, Trigger {
                                 replace: replace.clone(),
                                 vars: m.vars.clone(),
                             });
@@ -171,27 +233,27 @@ fn load_yaml_recursive(dir: &PathBuf, triggers: &mut HashMap<String, Trigger>, g
     }
 }
 
-fn load_configs() -> HashMap<String, Trigger> {
-    let mut triggers = HashMap::new();
-    let mut global_vars = Vec::new();
+fn load_configs() -> Configs {
+    let mut configs = Configs::default();
     let config_dir = get_config_path();
 
     if config_dir.exists() {
-        load_yaml_recursive(&config_dir, &mut triggers, &mut global_vars);
+        load_yaml_recursive(&config_dir, &mut configs);
     } else {
         eprintln!("Config directory not found: {:?}", config_dir);
     }
 
     // Prepend global_vars to each trigger's vars (so they're available for expansion)
-    if !global_vars.is_empty() {
-        for trigger in triggers.values_mut() {
+    if !configs.global_vars.is_empty() {
+        let global_vars = configs.global_vars.clone();
+        for trigger in configs.triggers.values_mut() {
             let mut merged = global_vars.clone();
             merged.extend(trigger.vars.clone());
             trigger.vars = merged;
         }
     }
 
-    triggers
+    configs
 }
 
 fn get_config_path() -> PathBuf {
@@ -211,15 +273,35 @@ fn get_config_path() -> PathBuf {
     PathBuf::from(home).join(".config/text_expander")
 }
 
-fn find_keyboards() -> Vec<Device> {
-    let mut keyboards = Vec::new();
-    let mut virtual_kbd = None;
+// The path is kept alongside the device so a rescan can tell an already-open keyboard from a new
+// one. Without it, rescanning re-opens live devices and every keystroke arrives twice.
+struct Keyboard {
+    path: PathBuf,
+    device: Device,
+}
 
-    let Ok(entries) = fs::read_dir("/dev/input") else { return keyboards };
+// Last match wins. With several matching devices the name alone does not say which one replays real
+// typing, so the tie-break is arbitrary, but it stays stable across rescans.
+fn pick_virtual(names: &[String]) -> Option<usize> {
+    names.iter().rposition(|n| n.to_lowercase().contains("virtual"))
+}
+
+// Adds keyboards that appeared since the last call, leaving already-tracked ones untouched. Called
+// once at startup with an empty list and then periodically, so hotplug and cold start share a path.
+//
+// With `virtual_only`, collapse to the single virtual keyboard a remapper (keyd/kmonad) exposes,
+// since it replays every real keystroke. Off by default: output-only virtual devices such as
+// ydotoold's also match the name, and preferring one of those means reading a device that never
+// emits the user's typing.
+fn scan_keyboards(virtual_only: bool, keyboards: &mut Vec<Keyboard>) {
+    let Ok(entries) = fs::read_dir("/dev/input") else { return };
+
+    let mut found = 0;
 
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.to_string_lossy().contains("event") { continue }
+        if keyboards.iter().any(|k| k.path == path) { continue }
 
         let Ok(device) = Device::open(&path) else { continue };
 
@@ -228,21 +310,32 @@ fn find_keyboards() -> Vec<Device> {
         let Some(keys) = device.supported_keys() else { continue };
         if !keys.contains(Key::KEY_A) || !keys.contains(Key::KEY_Z) { continue }
 
-        let name = device.name().unwrap_or("unknown");
-        eprintln!("Found keyboard: {:?} - {}", path, name);
-
-        if name.to_lowercase().contains("virtual") {
-            virtual_kbd = Some(device);
-        } else if virtual_kbd.is_none() {
-            keyboards.push(device);
-        }
+        eprintln!("Found keyboard: {:?} - {}", path, device.name().unwrap_or("unknown"));
+        keyboards.push(Keyboard { path, device });
+        found += 1;
     }
 
-    if let Some(vkbd) = virtual_kbd {
-        eprintln!("Using virtual keyboard only (keyd/kmonad detected)");
-        vec![vkbd]
-    } else {
-        keyboards
+    if found == 0 || !virtual_only {
+        return;
+    }
+
+    // Re-applied over the whole set, not just the arrivals, so a remapper started after us still
+    // wins: the fall-back set of real keyboards collapses as soon as its virtual device shows up.
+    let names: Vec<String> = keyboards.iter()
+        .map(|k| k.device.name().unwrap_or("unknown").to_string())
+        .collect();
+
+    match pick_virtual(&names) {
+        Some(i) => {
+            if keyboards.len() > 1 {
+                eprintln!("Using virtual keyboard only (--virtual-only): {}", names[i]);
+            }
+            keyboards.drain(i + 1..);
+            keyboards.drain(..i);
+        }
+        None => {
+            eprintln!("Warning: --virtual-only given but no virtual keyboard found, using all keyboards");
+        }
     }
 }
 
@@ -265,17 +358,36 @@ fn get_wayland_env() -> Vec<(String, String)> {
     env_vars
 }
 
+static MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn run_wtype(args: &[&str]) {
-    if let Ok(sudo_user) = env::var("SUDO_USER") {
-        let mut cmd = process::Command::new("sudo");
-        cmd.arg("-u").arg(&sudo_user).arg("env");
-        for (k, v) in get_wayland_env() {
-            cmd.arg(format!("{}={}", k, v));
+    let (bin, mut cmd) = match env::var("SUDO_USER") {
+        Ok(sudo_user) => {
+            let mut cmd = process::Command::new("sudo");
+            cmd.arg("-u").arg(&sudo_user).arg("env");
+            for (k, v) in get_wayland_env() {
+                cmd.arg(format!("{}={}", k, v));
+            }
+            cmd.arg("wtype").args(args);
+            ("sudo", cmd)
         }
-        cmd.arg("wtype").args(args);
-        let _ = cmd.status();
-    } else {
-        let _ = process::Command::new("wtype").args(args).status();
+        Err(_) => {
+            let mut cmd = process::Command::new("wtype");
+            cmd.args(args);
+            ("wtype", cmd)
+        }
+    };
+
+    // Never fatal: a failed expansion should not take down a running daemon.
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("{} exited with {}", bin, status),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if !MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("{} not found - expansions cannot be typed. Install wtype.", bin);
+            }
+        }
+        Err(e) => eprintln!("Failed to run {}: {}", bin, e),
     }
 }
 
@@ -294,43 +406,62 @@ fn type_expansion(backspaces: usize, text: &str) {
 
 struct TextExpander {
     triggers: HashMap<String, Trigger>,
+    decoder: Decoder,
     buffer: String,
+    // Counted in characters, not bytes: many layouts produce multi-byte characters.
     max_len: usize,
-    shift: bool,
+    debug_keys: bool,
 }
 
 impl TextExpander {
-    fn new(triggers: HashMap<String, Trigger>) -> Self {
-        let max_len = triggers.keys().map(|k| k.len()).max().unwrap_or(64);
-        Self { triggers, buffer: String::with_capacity(max_len + 1), max_len, shift: false }
+    fn new(triggers: HashMap<String, Trigger>, decoder: Decoder, debug_keys: bool) -> Self {
+        let max_len = triggers.keys().map(|k| k.chars().count()).max().unwrap_or(64);
+        Self {
+            triggers,
+            decoder,
+            buffer: String::with_capacity((max_len + 1) * 4),
+            max_len,
+            debug_keys,
+        }
     }
 
-    fn process(&mut self, key: Key, pressed: bool) -> Option<(usize, String)> {
-        if key == Key::KEY_LEFTSHIFT || key == Key::KEY_RIGHTSHIFT {
-            self.shift = pressed;
-            return None;
-        }
+    // Returns (backspaces, replacement) when a trigger fires. `value` is the raw evdev value.
+    fn process(&mut self, code: u16, value: i32) -> Option<(usize, String)> {
+        let text = self.decoder.feed(code, value)?;
 
-        if !pressed { return None }
-
-        match key {
+        match Key::new(code) {
             Key::KEY_ENTER | Key::KEY_TAB | Key::KEY_ESC => { self.buffer.clear(); return None }
             Key::KEY_BACKSPACE => { self.buffer.pop(); return None }
             _ => {}
         }
 
-        if let Some(c) = key_to_char(key, self.shift) {
-            self.buffer.push(c);
-            if self.buffer.len() > self.max_len {
-                self.buffer.drain(..self.buffer.len() - self.max_len);
-            }
+        // Ctrl+A and friends are commands, and may move the cursor; the buffer no longer
+        // reflects what is on screen.
+        if self.decoder.shortcut_active() {
+            self.buffer.clear();
+            return None;
+        }
 
-            for (trig, data) in &self.triggers {
-                if self.buffer.ends_with(trig) {
-                    let result = (trig.len(), data.expand());
-                    self.buffer.clear();
-                    return Some(result);
-                }
+        // Empty for dead keys and non-text keys such as arrows. Control characters are dropped so
+        // the likes of "\r" cannot enter the buffer.
+        for c in text.chars().filter(|c| !c.is_control()) {
+            self.buffer.push(c);
+        }
+
+        while self.buffer.chars().count() > self.max_len {
+            self.buffer.remove(0);
+        }
+
+        if self.debug_keys && !text.is_empty() {
+            eprintln!("key code {} -> {:?} | buffer {:?}", code, text, self.buffer);
+        }
+
+        for (trig, data) in &self.triggers {
+            if self.buffer.ends_with(trig) {
+                // Backspaces are a count of characters, not bytes.
+                let result = (trig.chars().count(), data.expand());
+                self.buffer.clear();
+                return Some(result);
             }
         }
         None
@@ -365,19 +496,38 @@ fn daemonize() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let daemon_mode = args.iter().any(|a| a == "-d" || a == "--daemon");
+    let virtual_only = args.iter().any(|a| a == "--virtual-only");
+    let debug_keys = args.iter().any(|a| a == "--debug-keys");
 
     eprintln!("text_expander - lightweight espanso replacement for Wayland");
 
-    let triggers = load_configs();
-    if triggers.is_empty() {
+    let configs = load_configs();
+    if configs.triggers.is_empty() {
         eprintln!("No triggers loaded. Create config in ~/.config/text_expander/");
         process::exit(1);
     }
-    eprintln!("Loaded {} triggers", triggers.len());
+    eprintln!("Loaded {} triggers", configs.triggers.len());
 
-    let mut keyboards = find_keyboards();
+    let layout = configs.layout.unwrap_or_else(|| {
+        eprintln!("Warning: no keyboard_layout configured. Using XKB_DEFAULT_LAYOUT/XKB_DEFAULT_VARIANT,");
+        eprintln!("         or US if those are unset. Set it in config/default.yml if you type another layout.");
+        KeyboardLayout::default()
+    });
+
+    // A layout named in the config that XKB cannot compile is fatal. The US fallback above covers the
+    // case where nothing is configured; applying it here too would decode every keystroke of the
+    // requested layout to the wrong character, which looks like triggers simply not working.
+    let Some(decoder) = Decoder::new(&layout) else {
+        eprintln!("Failed to compile keymap for rule={:?} model={:?} layout={:?} variant={:?} options={:?}",
+            layout.rule, layout.model, layout.layout, layout.variant, layout.options);
+        eprintln!("The layout and variant must exist in /usr/share/X11/xkb/symbols/.");
+        process::exit(1);
+    };
+
+    let mut keyboards = Vec::new();
+    scan_keyboards(virtual_only, &mut keyboards);
     if keyboards.is_empty() {
-        eprintln!("No keyboards found. Need read access to /dev/input/*");
+        eprintln!("No keyboards found. Need read access to /dev/input/* (join the 'input' group)");
         process::exit(1);
     }
 
@@ -388,29 +538,59 @@ fn main() {
         eprintln!("Ready! (use -d/--daemon to run in background)");
     }
 
-    let mut expander = TextExpander::new(triggers);
+    let mut expander = TextExpander::new(configs.triggers, decoder, debug_keys);
+
+    // Long enough that the idle cost is one read_dir per second, short enough that a replugged
+    // keyboard starts working before the user notices.
+    const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+    let mut last_scan = Instant::now();
+    let mut waiting_logged = false;
 
     loop {
-        let raw_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
-        let mut pollfds: Vec<libc::pollfd> = raw_fds.iter()
-            .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+        let mut pollfds: Vec<libc::pollfd> = keyboards.iter()
+            .map(|k| libc::pollfd { fd: k.device.as_raw_fd(), events: libc::POLLIN, revents: 0 })
             .collect();
 
-        if unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) } < 0 {
+        // With no keyboards left this is just a sleep until the next rescan.
+        if unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, RESCAN_INTERVAL.as_millis() as _) } < 0 {
             continue;
         }
 
+        let mut removed = false;
         let mut i = pollfds.len();
         while i > 0 {
             i -= 1;
             if pollfds[i].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                eprintln!("Keyboard disconnected (fd {}), removing", raw_fds[i]);
+                eprintln!("Keyboard disconnected ({:?}), removing", keyboards[i].path);
                 keyboards.remove(i);
+                removed = true;
             }
         }
-        if keyboards.is_empty() {
-            eprintln!("All keyboards disconnected, exiting");
-            process::exit(0);
+
+        // Rescan on a timer rather than on poll timeout: under autorepeat poll may never time out,
+        // and a keyboard plugged in mid-typing should not have to wait for an idle gap. This also
+        // adopts virtual devices created after startup (a late `ydotoold`), which in the default mode
+        // means reading back our own injected keystrokes; the post-expansion drain below and
+        // --virtual-only guard against that.
+        if removed || last_scan.elapsed() >= RESCAN_INTERVAL {
+            scan_keyboards(virtual_only, &mut keyboards);
+            last_scan = Instant::now();
+
+            if keyboards.is_empty() {
+                if !waiting_logged {
+                    eprintln!("All keyboards disconnected, waiting for one to reappear");
+                    waiting_logged = true;
+                }
+            } else {
+                waiting_logged = false;
+            }
+        }
+
+        // Every `ready` index above a removal now points at the wrong device, so skip this round
+        // entirely. Nothing is lost: events already queued on the survivors stay buffered in the
+        // kernel and the next poll reports them immediately.
+        if removed {
+            continue;
         }
 
         let ready: Vec<usize> = pollfds.iter().enumerate()
@@ -420,11 +600,10 @@ fn main() {
         let mut expanded = false;
 
         for &i in &ready {
-            if i >= keyboards.len() { continue }
-            if let Ok(events) = keyboards[i].fetch_events() {
+            if let Ok(events) = keyboards[i].device.fetch_events() {
                 for ev in events {
                     if ev.event_type() == EventType::KEY {
-                        if let Some((n, text)) = expander.process(Key::new(ev.code()), ev.value() == 1) {
+                        if let Some((n, text)) = expander.process(ev.code(), ev.value()) {
                             thread::sleep(Duration::from_millis(10));
                             type_expansion(n, &text);
                             expanded = true;
@@ -436,7 +615,7 @@ fn main() {
 
         if expanded {
             thread::sleep(Duration::from_millis(50));
-            let drain_fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
+            let drain_fds: Vec<i32> = keyboards.iter().map(|k| k.device.as_raw_fd()).collect();
             loop {
                 let mut drain: Vec<libc::pollfd> = drain_fds.iter()
                     .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
@@ -444,10 +623,162 @@ fn main() {
                 if unsafe { libc::poll(drain.as_mut_ptr(), drain.len() as _, 0) } <= 0 { break }
                 for (i, p) in drain.iter().enumerate() {
                     if p.revents & libc::POLLIN != 0 {
-                        let _ = keyboards[i].fetch_events().map(|e| e.count());
+                        let _ = keyboards[i].device.fetch_events().map(|e| e.count());
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // evdev codes, i.e. physical key positions as labelled on a US keyboard.
+    const KEY_T: u16 = 20;
+    const KEY_S: u16 = 31;
+    const KEY_H: u16 = 35;
+    const KEY_L: u16 = 38;
+    const KEY_Z: u16 = 44;
+    const KEY_M: u16 = 50;
+    const KEY_DOT: u16 = 52;
+
+    fn layout(layout: &str, variant: &str) -> KeyboardLayout {
+        KeyboardLayout { layout: layout.into(), variant: variant.into(), ..Default::default() }
+    }
+
+    fn decoder(l: &KeyboardLayout) -> Decoder {
+        Decoder::new(l).expect("keymap should compile (needs xkb data in /usr/share/X11/xkb)")
+    }
+
+    fn press(d: &mut Decoder, code: u16) -> String {
+        let text = d.feed(code, 1).unwrap_or_default();
+        d.feed(code, 0);
+        text
+    }
+
+    // Physical KEY_L is 't' on de/neo, so decoding by keymap rather than by US key position is what
+    // makes a "ts.." trigger reachable at all.
+    #[test]
+    fn decodes_neo_layout_by_position() {
+        let mut d = decoder(&layout("de", "neo"));
+        assert_eq!(press(&mut d, KEY_L), "t");
+        assert_eq!(press(&mut d, KEY_H), "s");
+        assert_eq!(press(&mut d, KEY_T), "w");
+        assert_eq!(press(&mut d, KEY_S), "i");
+        // Identical in both layouts, so these decode the same either way.
+        assert_eq!(press(&mut d, KEY_M), "m");
+        assert_eq!(press(&mut d, KEY_DOT), ".");
+    }
+
+    #[test]
+    fn decodes_us_layout_by_position() {
+        let mut d = decoder(&layout("us", ""));
+        assert_eq!(press(&mut d, KEY_L), "l");
+        assert_eq!(press(&mut d, KEY_T), "t");
+    }
+
+    // The no-config path: empty names let libxkbcommon resolve XKB_DEFAULT_* and then US.
+    #[test]
+    fn empty_layout_falls_back_to_a_working_keymap() {
+        let mut d = decoder(&KeyboardLayout::default());
+        assert!(!press(&mut d, KEY_L).is_empty());
+    }
+
+    // The configured-by-name path is a hard error rather than a silent US fallback.
+    #[test]
+    fn unknown_layout_name_does_not_compile() {
+        assert!(Decoder::new(&layout("definitely-not-a-layout", "")).is_none());
+    }
+
+    #[test]
+    fn autorepeat_does_not_desync_modifiers() {
+        const KEY_LEFTSHIFT: u16 = 42;
+        let mut d = decoder(&layout("us", ""));
+        d.feed(KEY_LEFTSHIFT, 1);
+        // Value 2 is autorepeat. Treating it as a release would drop shift.
+        d.feed(KEY_LEFTSHIFT, 2);
+        assert_eq!(d.feed(KEY_T, 1), Some("T".into()));
+    }
+
+    fn expander(triggers: &[(&str, &str)], l: &KeyboardLayout) -> TextExpander {
+        let map = triggers.iter()
+            .map(|(t, r)| ((*t).into(), Trigger { replace: (*r).into(), vars: vec![] }))
+            .collect();
+        TextExpander::new(map, decoder(l), false)
+    }
+
+    #[test]
+    fn fires_trigger_typed_in_neo() {
+        let neo = layout("de", "neo");
+        let mut e = expander(&[("ts..", "expanded")], &neo);
+
+        // Physical keys a Neo typist presses for "ts..".
+        for code in [KEY_L, KEY_H, KEY_DOT] {
+            assert!(e.process(code, 1).is_none());
+            e.process(code, 0);
+        }
+        assert_eq!(e.process(KEY_DOT, 1), Some((4, "expanded".into())));
+    }
+
+    #[test]
+    fn does_not_fire_on_us_positions() {
+        let neo = layout("de", "neo");
+        let mut e = expander(&[("ts..", "expanded")], &neo);
+
+        // The QWERTY positions for "ts" must not match while a de/neo keymap is active.
+        for code in [KEY_T, KEY_S, KEY_DOT, KEY_DOT] {
+            assert_eq!(e.process(code, 1), None);
+            e.process(code, 0);
+        }
+    }
+
+    // The buffer is trimmed by character count; trimming by byte index would panic mid-character.
+    #[test]
+    fn multibyte_buffer_does_not_panic() {
+        let neo = layout("de", "neo");
+        // Physical KEY_Z is 'ü' on neo: two bytes, one character.
+        assert_eq!(press(&mut decoder(&neo), KEY_Z), "ü");
+
+        let mut e = expander(&[("teamsen..", "x")], &neo);
+        for _ in 0..40 {
+            assert_eq!(e.process(KEY_Z, 1), None);
+            e.process(KEY_Z, 0);
+        }
+        assert_eq!(e.buffer.chars().count(), 9);
+    }
+
+    #[test]
+    fn backspace_count_is_characters_not_bytes() {
+        let neo = layout("de", "neo");
+        let mut e = expander(&[("üü", "x")], &neo);
+
+        assert_eq!(e.process(KEY_Z, 1), None);
+        e.process(KEY_Z, 0);
+        // "üü" is 4 bytes but must delete only 2 typed characters.
+        assert_eq!(e.process(KEY_Z, 1), Some((2, "x".into())));
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).into()).collect()
+    }
+
+    #[test]
+    fn picks_virtual_keyboard_case_insensitively() {
+        assert_eq!(pick_virtual(&names(&["AT Translated Set 2 keyboard", "keyd virtual keyboard"])), Some(1));
+        assert_eq!(pick_virtual(&names(&["KMonad Virtual Keyboard", "Logitech K380"])), Some(0));
+    }
+
+    #[test]
+    fn picks_no_virtual_keyboard_when_none_matches() {
+        assert_eq!(pick_virtual(&names(&["AT Translated Set 2 keyboard", "Logitech K380"])), None);
+        assert_eq!(pick_virtual(&[]), None);
+    }
+
+    // Ties go to the last match: an arbitrary but stable choice.
+    #[test]
+    fn picks_last_virtual_keyboard_on_tie() {
+        assert_eq!(pick_virtual(&names(&["ydotoold virtual device", "real kbd", "keyd virtual keyboard"])), Some(2));
     }
 }
