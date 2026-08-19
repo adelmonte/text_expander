@@ -9,7 +9,17 @@ Supports the most commonly used espanso match features (simple triggers, variabl
 - Linux + Wayland
 - `wtype` (text injection)
 - `wl-paste` (clipboard variable support)
-- Root access for `/dev/input/event*`
+- `libxkbcommon` (keyboard layout decoding)
+- Read access to `/dev/input/event*`
+
+Root is not required. On most distros `/dev/input/event*` is owned by the `input` group, so
+joining it is enough:
+
+```bash
+sudo usermod -aG input "$USER"
+```
+
+Log out and back in for the new group to apply (`id` should list `input`).
 
 ## Build
 
@@ -21,15 +31,71 @@ sudo cp target/release/text_expander /usr/local/bin/
 ## Usage
 
 ```bash
-sudo text_expander        # foreground
-sudo text_expander -d     # daemon mode
+text_expander                  # foreground
+text_expander -d               # daemon mode
+text_expander --virtual-only   # keyd/kmonad setups (see below)
+text_expander --debug-keys     # print each decoded character and the trigger buffer
 ```
+
+Use `--debug-keys` when triggers do not fire: it shows what the program thinks you typed, which
+immediately reveals a wrong keyboard layout.
+
+### `--virtual-only`
+
+Key remappers like [keyd](https://github.com/rvaiya/keyd) and
+[kmonad](https://github.com/kmonad/kmonad) expose a virtual keyboard that replays every real
+keystroke. On those setups, pass `--virtual-only` to read that device alone and avoid seeing each
+keystroke twice.
+
+Do not pass it otherwise. Output-only virtual devices — such as the one `ydotoold` creates — also
+have "virtual" in their name but never emit your typing, so preferring one means no trigger ever
+matches. Without the flag, all detected keyboards are read.
+
+If the remapper starts after `text_expander`, its virtual keyboard is picked up on the next rescan
+(see below) and the real keyboards are dropped at that point.
+
+### Hotplug
+
+`/dev/input` is rescanned about once a second, so keyboards plugged in while the program runs start
+working within a second. Unplugging is handled too: the device is dropped and, if it was the last
+one, the program waits for a keyboard to reappear instead of exiting.
+
+At least one readable keyboard must be present at startup — otherwise it exits with the
+`input`-group hint, since that is nearly always a permissions problem rather than an empty machine.
 
 ## Config
 
 Location: `~/.config/text_expander/`
 
 All `.yml` and `.yaml` files are loaded recursively.
+
+### Keyboard layout (required for non-US layouts)
+
+evdev reports *physical key positions*, not characters, so the active keymap is needed to know what
+you typed. Set it in `config/default.yml`, using espanso's `keyboard_layout` block:
+
+```yaml
+keyboard_layout:
+  layout: "de"
+  variant: "neo"
+  # optional, all default to empty (libxkbcommon's own defaults)
+  # rule: ""
+  # model: "pc105"
+  # options: "grp:alt_shift_toggle"
+```
+
+Resolved by libxkbcommon against the same data X and Wayland compositors use, so any
+layout/variant in `/usr/share/X11/xkb/symbols/` works.
+
+If the block is omitted, the `XKB_DEFAULT_LAYOUT`/`XKB_DEFAULT_VARIANT` environment variables are
+used, falling back to US. That case prints a warning, because a wrong layout means triggers silently
+never match. If the block is present but names a layout libxkbcommon cannot compile, startup fails
+with an error instead: the US fallback is there for "nothing configured", not for a name that does
+not exist.
+
+**Layout switching is not tracked.** The configured layout is always used. If you have several
+groups configured and switch between them, triggers only match while the
+configured one is active.
 
 ### Syntax (espanso-compatible)
 
@@ -115,31 +181,31 @@ Simple trigger/replace matches and basic variable types will work as-is. Matches
 
 ## How It Works
 
-1. Reads keyboard input via evdev (prefers virtual keyboards like keyd/kmonad)
-2. Buffers keystrokes and matches against triggers
-3. On match: sends backspaces to delete trigger, types replacement via `wtype`
+1. Reads keyboard input via evdev (all keyboards, or one virtual device with `--virtual-only`),
+   rescanning `/dev/input` once a second so devices can come and go
+2. Decodes keycodes into characters with libxkbcommon, using the configured layout
+3. Buffers characters and matches against triggers
+4. On match: sends backspaces to delete trigger, types replacement via `wtype`
 
 ## Systemd Service
 
-`/etc/systemd/system/text_expander.service`:
+Run as a user service so it inherits your Wayland session. `~/.config/systemd/user/text_expander.service`:
 
 ```ini
 [Unit]
 Description=Text Expander
-After=graphical.target
+After=graphical-session.target
 
 [Service]
 ExecStart=/usr/local/bin/text_expander
 Restart=always
-Environment=SUDO_USER=yourusername
-Environment=SUDO_UID=1000
 
 [Install]
-WantedBy=graphical.target
+WantedBy=graphical-session.target
 ```
 
 ```bash
-sudo systemctl enable --now text_expander
+systemctl --user enable --now text_expander
 ```
 
 ## License
