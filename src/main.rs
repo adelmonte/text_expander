@@ -111,10 +111,10 @@ fn run_command(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-// evdev reports physical key positions, not characters. Translating them requires the active
-// keymap: on a de/neo layout, physical KEY_L produces 't', so a hardcoded US table decodes most
-// keys wrong. libxkbcommon compiles the real keymap and tracks modifiers, which also makes Neo's
-// Mod3/Mod5 levels work for free.
+// evdev reports physical key positions, not characters. Which character a position produces depends
+// on the active keymap, so a hardcoded US table decodes most keys wrong on any other layout.
+// libxkbcommon compiles the real keymap and tracks modifier state, so layouts with more than the
+// two shift levels decode correctly as well.
 struct Decoder {
     state: xkb::State,
 }
@@ -141,8 +141,8 @@ impl Decoder {
         let keycode = xkb::Keycode::new(code as u32 + 8);
 
         match value {
-            // Read the symbol before updating state, so a locked/latched modifier (Neo puts its
-            // level-3 switch on CapsLock) does not apply to the keypress that set it.
+            // Read the symbol before updating state, so a locked or latched modifier does not apply
+            // to the keypress that set it. Layouts that put a level switch on CapsLock rely on this.
             1 => {
                 let text = self.state.key_get_utf8(keycode);
                 self.state.update_key(keycode, xkb::KeyDirection::Down);
@@ -158,8 +158,8 @@ impl Decoder {
         }
     }
 
-    // Ctrl/Alt/Super combinations are shortcuts rather than text. Neo's level switches are
-    // Mod3/Mod5, so its layers are deliberately not treated as modifiers here.
+    // Ctrl/Alt/Super combinations are shortcuts rather than text. Level switches (Mod3/Mod5) are
+    // deliberately excluded: they select further symbol levels, so they produce text, not shortcuts.
     fn shortcut_active(&self) -> bool {
         [xkb::MOD_NAME_CTRL, xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO]
             .iter()
@@ -280,7 +280,8 @@ struct Keyboard {
     device: Device,
 }
 
-// Last match wins, matching the pre-rescan behaviour where the loop overwrote `virtual_kbd`.
+// Last match wins. With several matching devices the name alone does not say which one replays real
+// typing, so the tie-break is arbitrary, but it stays stable across rescans.
 fn pick_virtual(names: &[String]) -> Option<usize> {
     names.iter().rposition(|n| n.to_lowercase().contains("virtual"))
 }
@@ -407,7 +408,7 @@ struct TextExpander {
     triggers: HashMap<String, Trigger>,
     decoder: Decoder,
     buffer: String,
-    // Counted in characters, not bytes: a de/neo layout produces multi-byte text.
+    // Counted in characters, not bytes: many layouts produce multi-byte characters.
     max_len: usize,
     debug_keys: bool,
 }
@@ -508,16 +509,18 @@ fn main() {
     eprintln!("Loaded {} triggers", configs.triggers.len());
 
     let layout = configs.layout.unwrap_or_else(|| {
-        eprintln!("Warning: no keyboard_layout configured, falling back to XKB_DEFAULT_* or US.");
-        eprintln!("         Set it in config/default.yml if your layout is not US.");
+        eprintln!("Warning: no keyboard_layout configured. Using XKB_DEFAULT_LAYOUT/XKB_DEFAULT_VARIANT,");
+        eprintln!("         or US if those are unset. Set it in config/default.yml if you type another layout.");
         KeyboardLayout::default()
     });
 
-    // Exit rather than falling back to US: a silently wrong layout decodes every keystroke to the
-    // wrong character, which looks like triggers simply not working.
+    // A layout named in the config that XKB cannot compile is fatal. The US fallback above covers the
+    // case where nothing is configured; applying it here too would decode every keystroke of the
+    // requested layout to the wrong character, which looks like triggers simply not working.
     let Some(decoder) = Decoder::new(&layout) else {
         eprintln!("Failed to compile keymap for rule={:?} model={:?} layout={:?} variant={:?} options={:?}",
             layout.rule, layout.model, layout.layout, layout.variant, layout.options);
+        eprintln!("The layout and variant must exist in /usr/share/X11/xkb/symbols/.");
         process::exit(1);
     };
 
@@ -565,10 +568,10 @@ fn main() {
         }
 
         // Rescan on a timer rather than on poll timeout: under autorepeat poll may never time out,
-        // and a keyboard plugged in mid-typing should not have to wait for an idle gap. Note this
-        // also adopts virtual devices created after startup (a late `ydotoold`), which in the
-        // default mode means reading back our own injected keystrokes -- the post-expansion drain
-        // below and --virtual-only remain the mitigations for that.
+        // and a keyboard plugged in mid-typing should not have to wait for an idle gap. This also
+        // adopts virtual devices created after startup (a late `ydotoold`), which in the default mode
+        // means reading back our own injected keystrokes; the post-expansion drain below and
+        // --virtual-only guard against that.
         if removed || last_scan.elapsed() >= RESCAN_INTERVAL {
             scan_keyboards(virtual_only, &mut keyboards);
             last_scan = Instant::now();
@@ -655,8 +658,8 @@ mod tests {
         text
     }
 
-    // The bug this replaced a hardcoded US table for: physical KEY_L is 't' on de/neo, so typing
-    // "ts" produced "lh" and never matched a "ts.." trigger.
+    // Physical KEY_L is 't' on de/neo, so decoding by keymap rather than by US key position is what
+    // makes a "ts.." trigger reachable at all.
     #[test]
     fn decodes_neo_layout_by_position() {
         let mut d = decoder(&layout("de", "neo"));
@@ -664,7 +667,7 @@ mod tests {
         assert_eq!(press(&mut d, KEY_H), "s");
         assert_eq!(press(&mut d, KEY_T), "w");
         assert_eq!(press(&mut d, KEY_S), "i");
-        // Identical in both layouts, which is why "m.." was the one trigger that worked.
+        // Identical in both layouts, so these decode the same either way.
         assert_eq!(press(&mut d, KEY_M), "m");
         assert_eq!(press(&mut d, KEY_DOT), ".");
     }
@@ -674,6 +677,19 @@ mod tests {
         let mut d = decoder(&layout("us", ""));
         assert_eq!(press(&mut d, KEY_L), "l");
         assert_eq!(press(&mut d, KEY_T), "t");
+    }
+
+    // The no-config path: empty names let libxkbcommon resolve XKB_DEFAULT_* and then US.
+    #[test]
+    fn empty_layout_falls_back_to_a_working_keymap() {
+        let mut d = decoder(&KeyboardLayout::default());
+        assert!(!press(&mut d, KEY_L).is_empty());
+    }
+
+    // The configured-by-name path is a hard error rather than a silent US fallback.
+    #[test]
+    fn unknown_layout_name_does_not_compile() {
+        assert!(Decoder::new(&layout("definitely-not-a-layout", "")).is_none());
     }
 
     #[test]
@@ -711,14 +727,14 @@ mod tests {
         let neo = layout("de", "neo");
         let mut e = expander(&[("ts..", "expanded")], &neo);
 
-        // Typing at the QWERTY positions for "ts" used to trigger this by mistake.
+        // The QWERTY positions for "ts" must not match while a de/neo keymap is active.
         for code in [KEY_T, KEY_S, KEY_DOT, KEY_DOT] {
             assert_eq!(e.process(code, 1), None);
             e.process(code, 0);
         }
     }
 
-    // Multi-byte characters used to be trimmed by byte index, panicking mid-character.
+    // The buffer is trimmed by character count; trimming by byte index would panic mid-character.
     #[test]
     fn multibyte_buffer_does_not_panic() {
         let neo = layout("de", "neo");
@@ -760,7 +776,7 @@ mod tests {
         assert_eq!(pick_virtual(&[]), None);
     }
 
-    // Ties go to the last match, as the pre-rescan scan loop did by overwriting its candidate.
+    // Ties go to the last match: an arbitrary but stable choice.
     #[test]
     fn picks_last_virtual_keyboard_on_tie() {
         assert_eq!(pick_virtual(&names(&["ydotoold virtual device", "real kbd", "keyd virtual keyboard"])), Some(2));
