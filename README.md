@@ -85,16 +85,16 @@ keyboard_layout:
 ```
 
 Resolved by libxkbcommon against the same data X and Wayland compositors use, so any
-layout/variant in `/usr/share/X11/xkb/symbols/` works. Modifier levels come along for free —
-including multi-level layouts like Neo, whose level 3-6 symbols and home-row numpad decode
-correctly.
+layout/variant in `/usr/share/X11/xkb/symbols/` works.
 
-If omitted, the `XKB_DEFAULT_LAYOUT`/`XKB_DEFAULT_VARIANT` environment variables are used, falling
-back to US. A wrong layout means triggers silently never match, so a warning is printed when
-nothing is configured, and an unknown layout name is a hard error rather than a silent US fallback.
+If the block is omitted, the `XKB_DEFAULT_LAYOUT`/`XKB_DEFAULT_VARIANT` environment variables are
+used, falling back to US. That case prints a warning, because a wrong layout means triggers silently
+never match. If the block is present but names a layout libxkbcommon cannot compile, startup fails
+with an error instead: the US fallback is there for "nothing configured", not for a name that does
+not exist.
 
 **Layout switching is not tracked.** The configured layout is always used. If you have several
-groups configured (e.g. `layout: "de,de"`) and switch between them, triggers only match while the
+groups configured and switch between them, triggers only match while the
 configured one is active.
 
 ### Syntax (espanso-compatible)
