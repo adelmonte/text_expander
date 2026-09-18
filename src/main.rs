@@ -83,7 +83,13 @@ impl Trigger {
 }
 
 fn run_command(cmd: &str, args: &[&str]) -> String {
-    process::Command::new(cmd)
+    // Never run config-supplied commands as root: drop to the invoking user,
+    // and refuse outright if we're root with no user to drop to.
+    if env::var("SUDO_USER").is_err() && unsafe { libc::geteuid() } == 0 {
+        eprintln!("Refusing to run {:?} as root (SUDO_USER not set)", cmd);
+        return String::new();
+    }
+    user_command(cmd)
         .args(args)
         .output()
         .ok()
@@ -265,18 +271,23 @@ fn get_wayland_env() -> Vec<(String, String)> {
     env_vars
 }
 
-fn run_wtype(args: &[&str]) {
+// Build a command that runs as the invoking user (via sudo) when started with sudo.
+fn user_command(program: &str) -> process::Command {
     if let Ok(sudo_user) = env::var("SUDO_USER") {
         let mut cmd = process::Command::new("sudo");
-        cmd.arg("-u").arg(&sudo_user).arg("env");
+        cmd.arg("-H").arg("-u").arg(&sudo_user).arg("env");
         for (k, v) in get_wayland_env() {
             cmd.arg(format!("{}={}", k, v));
         }
-        cmd.arg("wtype").args(args);
-        let _ = cmd.status();
+        cmd.arg(program);
+        cmd
     } else {
-        let _ = process::Command::new("wtype").args(args).status();
+        process::Command::new(program)
     }
+}
+
+fn run_wtype(args: &[&str]) {
+    let _ = user_command("wtype").args(args).status();
 }
 
 fn type_expansion(backspaces: usize, text: &str) {
