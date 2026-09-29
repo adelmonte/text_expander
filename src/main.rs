@@ -456,13 +456,16 @@ impl TextExpander {
             eprintln!("key code {} -> {:?} | buffer {:?}", code, text, self.buffer);
         }
 
-        for (trig, data) in &self.triggers {
-            if self.buffer.ends_with(trig) {
-                // Backspaces are a count of characters, not bytes.
-                let result = (trig.chars().count(), data.expand());
-                self.buffer.clear();
-                return Some(result);
-            }
+        // The longest matching trigger wins, so a trigger that ends with another
+        // (e.g. "tbr" vs. "br") is not shadowed by the shorter one.
+        let best = self.triggers.iter()
+            .filter(|(trig, _)| self.buffer.ends_with(trig.as_str()))
+            .max_by_key(|(trig, _)| trig.chars().count());
+        if let Some((trig, data)) = best {
+            // Backspaces are a count of characters, not bytes.
+            let result = (trig.chars().count(), data.expand());
+            self.buffer.clear();
+            return Some(result);
         }
         None
     }
