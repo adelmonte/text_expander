@@ -364,9 +364,12 @@ fn get_wayland_env() -> Vec<(String, String)> {
     env_vars
 }
 
-// Build a command that runs as the invoking user (via sudo) when started with sudo.
+// Build a command that runs as the invoking user (via sudo) when started with sudo. Only applies
+// while root: SUDO_USER can also be inherited by a non-root process (e.g. `sudo -u other`), where
+// calling sudo again would prompt for a password or fail.
 fn user_command(program: &str) -> process::Command {
-    if let Ok(sudo_user) = env::var("SUDO_USER") {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if let (true, Ok(sudo_user)) = (is_root, env::var("SUDO_USER")) {
         let mut cmd = process::Command::new("sudo");
         cmd.arg("-H").arg("-u").arg(&sudo_user).arg("env");
         for (k, v) in get_wayland_env() {
