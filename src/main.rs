@@ -559,6 +559,7 @@ fn main() {
             continue;
         }
 
+        let polled_paths: Vec<PathBuf> = keyboards.iter().map(|k| k.path.clone()).collect();
         let mut removed = false;
         let mut i = pollfds.len();
         while i > 0 {
@@ -589,10 +590,12 @@ fn main() {
             }
         }
 
-        // Every `ready` index above a removal now points at the wrong device, so skip this round
-        // entirely. Nothing is lost: events already queued on the survivors stay buffered in the
-        // kernel and the next poll reports them immediately.
-        if removed {
+        // `pollfds` indexes the set as it was before removals and the rescan. Any change to that set
+        // (a removal, or --virtual-only collapsing onto a newly appeared remapper) leaves `ready`
+        // indices pointing at the wrong device or past the end, so skip this round entirely. Nothing
+        // is lost: events already queued on the survivors stay buffered in the kernel and the next
+        // poll reports them immediately.
+        if removed || !keyboards.iter().map(|k| &k.path).eq(polled_paths.iter()) {
             continue;
         }
 
