@@ -21,7 +21,15 @@ sudo usermod -aG input "$USER"
 
 Log out and back in for the new group to apply (`id` should list `input`).
 
-## Build
+## Install
+
+Arch Linux (AUR):
+
+```bash
+yay -S text_expander
+```
+
+From source:
 
 ```bash
 cargo build --release
